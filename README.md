@@ -4,6 +4,8 @@
 
 ExRest is an Elixir library that provides a PostgREST-compatible REST API deeply integrated with Phoenix applications. Define Ecto schemas, get a full REST API with Supabase client compatibility.
 
+**Companion Library:** ExRest integrates with **Authzura**, a standalone authorization library providing dynamic roles, role inheritance, multi-role users, and Hasura-compatible permission syntax.
+
 **Core Approach:**
 
 ```elixir
@@ -32,7 +34,8 @@ end
 **Key Features:**
 - **Supabase/PostgREST Compatible** - Same URL syntax, headers, JWT handling
 - **Ecto-Native** - Schemas define API resources; changesets for mutations
-- **Layered Filtering** - `scope/2` callbacks + optional JSON permissions + URL params
+- **Layered Filtering** - `scope/2` callbacks + Authzura permissions + URL params
+- **Dynamic Authorization** - Authzura provides tenant-specific roles, inheritance, multi-role merging
 - **Type-Safe** - Compile-time atoms, Ecto casting, no SQL injection surface
 - **Plugin System** - Extensible operators for PostGIS, pgvector, full-text search
 - **Optional Caching** - Nebulex integration (local, distributed, or multi-level)
@@ -45,7 +48,7 @@ Base query (from schema)
     ↓
 scope/2 (tenant isolation, soft deletes - always runs)
     ↓
-JSON permissions (optional role-based filters from metadata)
+Authzura (dynamic role-based filters)
     ↓
 URL filters (?status=eq.active)
     ↓
@@ -60,11 +63,14 @@ select, order, limit → execute
 3. Comparison - ExRest vs PostgREST vs Hasura
 4. Security - Threat model, Ecto advantages, deployment checklist
 5. Supabase Compatibility - Headers, JWT, session variables
-6. Performance - Native JSON, optional caching
+6. Performance - Standard Phoenix patterns, streaming, optimization
 7. Operational - Headers, logging, optional rate limiting
 8. Future Considerations - Open questions
 9. Extensibility - Plugins, Nebulex, Hammer, multi-node OTP
-10. Appendices - Operator reference, code examples
+10. Authzura Integration - Quick reference (see `authzura.md` for full docs)
+11. Appendices - Operator reference, code examples
+
+**Companion Library:** See `authzura.md` for complete Authzura documentation including schema design, caching, Phoenix/LiveView examples, and Hasura import.
 
 ---
 
@@ -495,9 +501,9 @@ defmodule MyApp.API.Orders do
     timestamps()
   end
   
-  # Hasura-compatible JSON permissions (optional, stored in metadata table)
-  # These are applied automatically based on role from JWT
-  # See section 2.6 for details
+  # Authzura provides dynamic role-based permissions
+  # Applied automatically based on user's roles
+  # See Part 10: Authzura for details
   
   # Always-applied scope - runs before everything else
   @impl ExRest.Resource
@@ -662,7 +668,7 @@ defmodule ExRest.QueryPipeline do
   Pipeline:
   1. Base query from schema
   2. scope/2 callback (always runs)
-  3. JSON permissions (if configured)
+  3. Authzura permissions (dynamic role-based filters)
   4. URL filters (?status=eq.active)
   5. Custom params via handle_param/4
   6. Select, order, limit
@@ -676,7 +682,7 @@ defmodule ExRest.QueryPipeline do
       resource.module
       |> base_query()
       |> resource.module.scope(context)
-      |> apply_json_permissions(resource, context)
+      |> apply_authzura_permissions(resource, context)
       |> apply_url_filters(parsed.filters, resource)
       |> apply_custom_params(resource.module, params, context)
       |> apply_select(parsed.select, resource)
@@ -731,10 +737,14 @@ defmodule ExRest.QueryPipeline do
     from(r in module)
   end
   
-  defp apply_json_permissions(query, resource, context) do
-    case ExRest.Permissions.get_filter(resource.table, context.role, :select) do
-      nil -> query
-      filter -> ExRest.Permissions.apply_filter(query, filter, context)
+  defp apply_authzura_permissions(query, resource, context) do
+    # Get authorization adapter from config
+    auth_adapter = Application.get_env(:ex_rest, :authorization, ExRest.Authorization.Authzura)
+    
+    case auth_adapter.get_filter(resource.table, :select, context) do
+      {:ok, nil} -> query
+      {:ok, filter_dynamic} -> where(query, ^filter_dynamic)
+      {:error, _} -> where(query, false)  # Deny on error
     end
   end
   
@@ -890,169 +900,39 @@ defmodule ExRest.Filter do
 end
 ```
 
-### 2.6 JSON Permissions (Optional Layer)
+### 2.6 Authorization Integration (Authzura)
 
-JSON permissions can be stored in a metadata table and applied automatically. ExRest uses **PostgREST-style operators by default** (`eq.`, `gt.`, etc.) but supports Hasura-style underscore operators (`_eq`, `_gt`) for backwards compatibility.
+ExRest integrates with **Authzura**, a standalone authorization library for PostgreSQL. Authzura provides:
 
-> **Hasura Metadata Compatibility:** ExRest permissions are designed to be compatible with Hasura's `hdb_metadata` permission format. If migrating from Hasura, you can import existing permission definitions with minimal changes. Both operator styles are fully supported and can be mixed.
+- Dynamic roles (tenant-specific, user-created at runtime)
+- Role inheritance
+- Multi-role users with permission merging
+- Hasura-compatible permission syntax
+- Optional Nebulex caching with PubSub invalidation
+- Materialized views for fast permission lookups
+- Admin UI for visual permission management
+
+See **`authzura.md`** for complete documentation including schema design, caching, and Phoenix/LiveView examples.
+
+**Quick Integration:**
 
 ```elixir
-defmodule ExRest.Permissions do
-  @moduledoc """
-  Optional JSON permissions layer.
-  
-  Supports two operator syntaxes:
-  - PostgREST-style (default): {"status": {"eq.": "active"}}
-  - Hasura-style (compatible): {"status": {"_eq": "active"}}
-  
-  Both styles can be mixed and are fully interchangeable.
-  """
-  
-  import Ecto.Query
-  
-  @doc """
-  Get the filter for a table/role/action combination.
-  Returns nil if no permission is configured (defaults to scope/2 only).
-  """
-  def get_filter(table, role, action) do
-    case ExRest.PermissionsCache.get({table, role, action}) do
-      {:ok, permission} -> permission["filter"]
-      :not_found -> nil
-    end
-  end
-  
-  @doc """
-  Apply a JSON filter expression to an Ecto query.
-  
-  PostgREST-style examples (recommended):
-  - {"status": {"eq.": "active"}}
-  - {"and": [{"status": {"eq.": "active"}}, {"total": {"gt.": 100}}]}
-  - {"user_id": {"eq.": "X-ExRest-User-Id"}}
-  
-  Hasura-style examples (backwards compatible):
-  - {"status": {"_eq": "active"}}
-  - {"_and": [{"status": {"_eq": "active"}}, {"total": {"_gt": 100}}]}
-  """
-  def apply_filter(query, nil, _context), do: query
-  def apply_filter(query, filter, context) when is_map(filter) do
-    dynamic = build_permission_dynamic(filter, context)
-    where(query, ^dynamic)
-  end
-  
-  # Logical operators - support both PostgREST and Hasura styles
-  @logical_and ["and", "_and"]
-  @logical_or ["or", "_or"]
-  @logical_not ["not", "_not"]
-  
-  defp build_permission_dynamic(filter, context) when is_map(filter) do
-    cond do
-      key = Enum.find(@logical_and, &Map.has_key?(filter, &1)) ->
-        filter[key]
-        |> Enum.map(&build_permission_dynamic(&1, context))
-        |> Enum.reduce(fn d, acc -> dynamic([r], ^acc and ^d) end)
-      
-      key = Enum.find(@logical_or, &Map.has_key?(filter, &1)) ->
-        filter[key]
-        |> Enum.map(&build_permission_dynamic(&1, context))
-        |> Enum.reduce(fn d, acc -> dynamic([r], ^acc or ^d) end)
-      
-      key = Enum.find(@logical_not, &Map.has_key?(filter, &1)) ->
-        inner = build_permission_dynamic(filter[key], context)
-        dynamic([r], not(^inner))
-      
-      true ->
-        # Column filter: {"column": {"op": value}}
-        filter
-        |> Enum.map(fn {column, op_value} ->
-          build_column_dynamic(column, op_value, context)
-        end)
-        |> Enum.reduce(fn d, acc -> dynamic([r], ^acc and ^d) end)
-    end
-  end
-  
-  # Operator mapping - PostgREST style (default) and Hasura style (compatible)
-  @operators %{
-    # PostgREST style (recommended)
-    "eq." => :eq, "neq." => :neq,
-    "gt." => :gt, "gte." => :gte,
-    "lt." => :lt, "lte." => :lte,
-    "like." => :like, "ilike." => :ilike,
-    "in." => :in, "is." => :is_null,
-    # Hasura style (backwards compatible)
-    "_eq" => :eq, "_neq" => :neq,
-    "_gt" => :gt, "_gte" => :gte,
-    "_lt" => :lt, "_lte" => :lte,
-    "_like" => :like, "_ilike" => :ilike,
-    "_in" => :in, "_is_null" => :is_null
-  }
-  
-  defp build_column_dynamic(column, op_value, context) when is_map(op_value) do
-    field_atom = String.to_existing_atom(column)
-    
-    [{op, raw_value}] = Map.to_list(op_value)
-    value = resolve_session_variable(raw_value, context)
-    op_atom = Map.fetch!(@operators, op)
-    
-    case op_atom do
-      :eq -> dynamic([r], field(r, ^field_atom) == ^value)
-      :neq -> dynamic([r], field(r, ^field_atom) != ^value)
-      :gt -> dynamic([r], field(r, ^field_atom) > ^value)
-      :gte -> dynamic([r], field(r, ^field_atom) >= ^value)
-      :lt -> dynamic([r], field(r, ^field_atom) < ^value)
-      :lte -> dynamic([r], field(r, ^field_atom) <= ^value)
-      :like -> dynamic([r], like(field(r, ^field_atom), ^value))
-      :ilike -> dynamic([r], ilike(field(r, ^field_atom), ^value))
-      :in -> dynamic([r], field(r, ^field_atom) in ^value)
-      :is_null when value == true -> dynamic([r], is_nil(field(r, ^field_atom)))
-      :is_null when value == false -> dynamic([r], not is_nil(field(r, ^field_atom)))
-    end
-  end
-  
-  # Resolve session variables from context
-  defp resolve_session_variable("X-ExRest-User-Id", ctx), do: ctx.user_id
-  defp resolve_session_variable("X-ExRest-Role", ctx), do: ctx.role
-  defp resolve_session_variable("X-ExRest-Tenant-Id", ctx), do: ctx.tenant_id
-  defp resolve_session_variable("X-Hasura-User-Id", ctx), do: ctx.user_id
-  defp resolve_session_variable("X-Hasura-Role", ctx), do: ctx.role
-  defp resolve_session_variable(value, _ctx), do: value
-end
+# config/config.exs
+config :ex_rest,
+  authorization: ExRest.Authorization.Authzura
+
+# The query pipeline integrates automatically:
+# scope/2 → Authzura permissions → URL filters → execute
 ```
 
-**Permissions Table Schema:**
+**Example Permission Filter (stored in Authzura):**
 
-```sql
-CREATE TABLE ex_rest.permissions (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  table_name TEXT NOT NULL,
-  role TEXT NOT NULL,
-  action TEXT NOT NULL CHECK (action IN ('select', 'insert', 'update', 'delete')),
-  
-  -- Permission filter (PostgREST or Hasura operator syntax supported)
-  filter JSONB,           -- Row filter (WHERE clause)
-  columns TEXT[],         -- Allowed columns (null = all)
-  check JSONB,            -- Validation for insert/update
-  set JSONB,              -- Column presets
-  
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW(),
-  
-  UNIQUE(table_name, role, action)
-);
-
--- Example: Users can only see their own orders (PostgREST style - recommended)
-INSERT INTO ex_rest.permissions (table_name, role, action, filter, columns) VALUES
-('orders', 'user', 'select', '{"user_id": {"eq.": "X-ExRest-User-Id"}}', ARRAY['id', 'reference', 'status', 'total', 'inserted_at']),
-('orders', 'user', 'insert', null, ARRAY['reference', 'shipping_address_id']),
-('orders', 'user', 'update', '{"and": [{"user_id": {"eq.": "X-ExRest-User-Id"}}, {"status": {"eq.": "pending"}}]}', ARRAY['shipping_address_id']),
-('orders', 'user', 'delete', null, null);  -- No delete permission (empty filter = denied)
-
--- Admins can do everything  
-INSERT INTO ex_rest.permissions (table_name, role, action, filter, columns) VALUES
-('orders', 'admin', 'select', null, null),
-('orders', 'admin', 'insert', null, null),
-('orders', 'admin', 'update', null, null),
-('orders', 'admin', 'delete', null, null);
+```json
+{"user_id": {"eq": "X-Authzura-User-Id"}}
+{"and": [{"tenant_id": {"eq": "X-Authzura-Tenant-Id"}}, {"status": {"in": ["active", "pending"]}}]}
 ```
+
+> **Note:** Authzura uses clean operator names (`eq`, `gt`, `and`) without dots or underscores. Hasura-style operators (`_eq`, `_gt`, `_and`) are accepted on import and converted automatically.
 
 ### 2.7 URL Filter Parser
 
@@ -1459,12 +1339,13 @@ ex_rest/
 │       │   └── filter.ex                 # Filter expression parser
 │       ├── filter.ex                     # Filter application to Ecto
 │       ├── select.ex                     # Select/preload application
-│       ├── permissions.ex                # JSON permissions (optional)
-│       ├── permissions_cache.ex          # Permissions caching
+│       ├── authorization.ex              # Authorization behavior
+│       ├── authorization/
+│       │   └── authzura.ex               # Authzura adapter
 │       ├── plug.ex                       # Phoenix plug
-│       ├── cache.ex                      # Query caching
+│       ├── cache.ex                      # Query caching (optional)
 │       ├── cache_adapter.ex              # Cache adapter behavior
-│       ├── rate_limiter.ex               # Rate limiting behavior
+│       ├── rate_limiter.ex               # Rate limiting behavior (optional)
 │       └── plugins/
 │           ├── plugin.ex                 # Plugin behavior
 │           ├── postgis.ex                # PostGIS operators
@@ -1502,11 +1383,11 @@ ex_rest/
 - Ecto preload integration
 - Nested filters on associations
 
-**Phase 4: JSON Permissions (Optional Layer)**
-- Permissions table schema
-- Permission caching with NOTIFY/LISTEN
-- Filter application from JSON permissions
-- Column-level permissions
+**Phase 4: Authzura Integration**
+- Authorization behavior and adapter pattern
+- Authzura adapter implementation
+- Permission filter application in pipeline
+- Column-level permission enforcement
 
 **Phase 5: Plugins**
 - Plugin behavior and registry
@@ -1514,7 +1395,7 @@ ex_rest/
 - Full-text search plugin
 - pgvector plugin
 
-**Phase 6: Caching & Rate Limiting**
+**Phase 6: Caching & Rate Limiting (Optional)**
 - Nebulex cache integration
 - Cache key strategy
 - Automatic invalidation on mutations
@@ -1535,19 +1416,20 @@ ex_rest/
 
 ### 3.1 Feature Comparison
 
-| Feature | PostgREST | Hasura | ExRest |
-|---------|-----------|--------|--------|
+| Feature | PostgREST | Hasura | ExRest + Authzura |
+|---------|-----------|--------|-------------------|
 | **Resource Definition** | Schema introspection | Track tables in metadata | Ecto schemas (`use ExRest.Resource`) |
 | **Table Exposure** | All in schema | Explicit tracking | Explicit schema modules |
-| **Permissions** | PostgreSQL GRANT/RLS | JSON metadata | `scope/2` callback + optional JSON |
+| **Permissions** | PostgreSQL GRANT/RLS | JSON metadata | `scope/2` + Authzura (dynamic roles) |
 | **Custom Filters** | PostgreSQL functions | Computed fields | `handle_param/4` callback |
 | **Mutations** | Raw SQL | GraphQL mutations | Ecto changesets |
 | **Type Safety** | Runtime | Runtime | Compile-time (Ecto) |
-| **Response Caching** | Not built-in | Not built-in | Optional Nebulex integration |
+| **Dynamic Roles** | No | Limited | Yes (Authzura) |
+| **Role Inheritance** | No | No | Yes (Authzura) |
+| **Multi-Role Users** | No | No | Yes (Authzura) |
+| **Response Caching** | Not built-in | Not built-in | Optional Nebulex |
 | **URL Compatibility** | Native | N/A | PostgREST-compatible |
 | **Integration** | Standalone binary | Standalone service | Embedded in Phoenix |
-| **Atom Safety** | N/A (Haskell) | N/A | Compile-time atoms |
-| **Rate Limiting** | External | External | Optional Hammer integration |
 
 ### 3.2 Key Architectural Decisions
 
@@ -1558,12 +1440,12 @@ ex_rest/
 - Associations defined in code, not introspected
 - Testable with Ecto sandbox
 
-**scope/2 Callback (vs JSON-Only Permissions)**
-- Full Elixir power for complex authorization
-- Tenant isolation, soft deletes in code
-- Composable Ecto queries
-- Easy to test with standard ExUnit
-- JSON permissions optional for runtime config
+**scope/2 + Authzura (vs Static JSON Permissions)**
+- `scope/2` for code-based authorization (tenant isolation, soft deletes)
+- Authzura for dynamic, user-defined roles
+- Role inheritance and multi-role permission merging
+- Hasura-compatible import for migrations
+- Full Elixir power when needed
 
 **handle_param/4 Callback (vs URL-Only Filtering)**
 - Custom parameters like `?search=` or `?within_miles=`
@@ -2082,11 +1964,11 @@ defmodule ExRest.Security.MassAssignment do
                     |> Enum.map(&to_string/1)
                     |> MapSet.new()
     
-    # Get allowed columns from permission (if using JSON permissions)
+    # Get allowed columns from Authzura permission (if configured)
     # or default to schema fields minus protected columns
     allowed = case permission do
       nil -> 
-        # No JSON permission - use changeset cast fields (defined in resource)
+        # No Authzura permission - use changeset cast fields (defined in resource)
         MapSet.difference(schema_fields, @never_writable)
       
       %{"columns" => "*"} -> 
@@ -2620,265 +2502,246 @@ end
 
 ## Part 6: Performance
 
-ExRest leverages PostgreSQL's native JSON functions for optimal performance. While the core architecture uses Ecto, performance-critical JSON generation may use raw SQL fragments for maximum efficiency.
+ExRest uses standard Phoenix/Ecto patterns for JSON responses, which provide excellent performance for the vast majority of use cases.
 
-> **Note:** The patterns below show the generated SQL. In practice, ExRest uses Ecto's `fragment/1` macro to embed these PostgreSQL-native JSON operations within Ecto queries, maintaining type safety while achieving optimal performance.
+### 6.1 Response Generation
 
-### 6.1 Performance Benefits
-
-PostgreSQL's native JSON functions (`json_agg`, `json_build_object`, `row_to_json`) are significantly faster than application-level JSON serialization because:
-
-1. **No data transfer overhead** - JSON is built where the data lives
-2. **Streaming results** - Single column result vs. multiple columns
-3. **Less memory** - No intermediate data structures in Elixir
-
-Benchmarks show **3-5x throughput improvement** for nested/embedded queries.
-
-### 6.2 JSON Generation Patterns
+ExRest uses Jason for JSON encoding, which is highly optimized:
 
 ```elixir
-# lib/ex_rest/query/json_builder.ex
-defmodule ExRest.Query.JsonBuilder do
+defmodule ExRest.Responder do
   @moduledoc """
-  Generates SQL that produces JSON output using PostgreSQL native functions.
-  
-  Uses:
-  - json_build_object() for explicit column selection (most efficient)
-  - json_agg() for array aggregation
-  - row_to_json() for full row conversion
-  - COALESCE for null handling
+  Handles JSON response generation using standard Phoenix patterns.
   """
-
+  
+  import Plug.Conn
+  
   @doc """
-  Builds a SELECT that returns JSON directly.
-  
-  ## Examples
-  
-      build_json_select(["id", "name"], "users", nil)
-      # => SELECT json_agg(json_build_object('id', "id", 'name', "name")) FROM "users"
-      
-      build_json_select(["id", "name", {:embed, "posts", ["id", "title"]}], "users", nil)
-      # => SELECT json_agg(json_build_object(
-      #      'id', "id",
-      #      'name', "name", 
-      #      'posts', (SELECT COALESCE(json_agg(...), '[]') FROM posts WHERE ...)
-      #    )) FROM "users"
+  Send a JSON response with appropriate headers.
   """
-  def build_json_select(columns, table, where_clause, opts \\ []) do
-    json_obj = build_json_object(columns, table)
-    
-    base = """
-    SELECT COALESCE(json_agg(_exrest_row), '[]'::json) AS data
-    FROM (
-      SELECT #{json_obj} AS _exrest_row
-      FROM #{quote_table(table)}
-      #{where_clause || ""}
-      #{build_order_clause(opts[:order])}
-      #{build_limit_clause(opts[:limit])}
-      #{build_offset_clause(opts[:offset])}
-    ) _exrest_subq
-    """
-    
-    String.trim(base)
+  def send_json(conn, data, status \\ 200) do
+    conn
+    |> put_resp_content_type("application/json")
+    |> send_resp(status, Jason.encode!(data))
   end
-
+  
   @doc """
-  Builds a json_build_object expression for columns.
+  Send a JSON response with PostgREST-compatible headers.
   """
-  def build_json_object(columns, parent_table) do
-    args = 
-      columns
-      |> Enum.flat_map(fn
-        {:embed, rel_name, rel_columns, rel_config} ->
-          ["'#{rel_name}'", build_embed_subquery(rel_name, rel_columns, rel_config, parent_table)]
-        
-        {:alias, alias_name, actual_column} ->
-          ["'#{alias_name}'", quote_column(actual_column)]
-        
-        {:json_path, path, alias_name} ->
-          ["'#{alias_name}'", path]
-        
-        column when is_binary(column) ->
-          ["'#{column}'", quote_column(column)]
-      end)
-      |> Enum.join(", ")
-    
-    "json_build_object(#{args})"
+  def send_postgrest_response(conn, data, opts \\ []) do
+    conn
+    |> put_resp_content_type("application/json")
+    |> maybe_add_count_header(opts[:count])
+    |> maybe_add_range_header(opts[:range])
+    |> send_resp(200, Jason.encode!(data))
   end
-
-  @doc """
-  Builds a subquery for embedded resources (relationships).
-  """
-  def build_embed_subquery(rel_name, columns, rel_config, parent_table) do
-    fk_column = rel_config[:foreign_key] || "#{singularize(parent_table)}_id"
-    pk_column = rel_config[:primary_key] || "id"
-    
-    inner_json = build_json_object(columns, rel_name)
-    
-    """
-    (SELECT COALESCE(json_agg(#{inner_json}), '[]'::json)
-     FROM #{quote_table(rel_name)}
-     WHERE #{quote_column(fk_column)} = #{quote_table(parent_table)}.#{quote_column(pk_column)})
-    """
+  
+  defp maybe_add_count_header(conn, nil), do: conn
+  defp maybe_add_count_header(conn, count) do
+    put_resp_header(conn, "content-range", "0-#{count - 1}/#{count}")
   end
-
-  @doc """
-  Builds SQL for a single row response.
-  """
-  def build_single_json_select(columns, table, where_clause) do
-    json_obj = build_json_object(columns, table)
-    
-    """
-    SELECT #{json_obj} AS data
-    FROM #{quote_table(table)}
-    #{where_clause}
-    LIMIT 1
-    """
-  end
-
-  @doc """
-  Builds aggregation queries (COUNT, SUM, etc.) with JSON output.
-  """
-  def build_aggregate_select(aggregates, table, where_clause) do
-    agg_exprs = 
-      aggregates
-      |> Enum.map(fn
-        {:count, "*"} -> "'count', COUNT(*)"
-        {:count, col} -> "'count_#{col}', COUNT(#{quote_column(col)})"
-        {:sum, col} -> "'sum_#{col}', SUM(#{quote_column(col)})"
-        {:avg, col} -> "'avg_#{col}', AVG(#{quote_column(col)})"
-        {:min, col} -> "'min_#{col}', MIN(#{quote_column(col)})"
-        {:max, col} -> "'max_#{col}', MAX(#{quote_column(col)})"
-      end)
-      |> Enum.join(", ")
-    
-    """
-    SELECT json_build_object(#{agg_exprs}) AS data
-    FROM #{quote_table(table)}
-    #{where_clause}
-    """
-  end
-
-  # Helper functions
-  defp quote_table(name), do: ~s("#{name}")
-  defp quote_column(name), do: ~s("#{name}")
   
-  defp build_order_clause(nil), do: ""
-  defp build_order_clause(order), do: "ORDER BY #{order}"
-  
-  defp build_limit_clause(nil), do: ""
-  defp build_limit_clause(n), do: "LIMIT #{n}"
-  
-  defp build_offset_clause(nil), do: ""
-  defp build_offset_clause(n), do: "OFFSET #{n}"
-  
-  defp singularize(name) do
-    cond do
-      String.ends_with?(name, "ies") -> 
-        String.replace_suffix(name, "ies", "y")
-      String.ends_with?(name, "es") -> 
-        String.replace_suffix(name, "es", "")
-      String.ends_with?(name, "s") -> 
-        String.replace_suffix(name, "s", "")
-      true -> 
-        name
-    end
+  defp maybe_add_range_header(conn, nil), do: conn
+  defp maybe_add_range_header(conn, {start, finish, total}) do
+    put_resp_header(conn, "content-range", "#{start}-#{finish}/#{total}")
   end
 end
 ```
 
-### 6.3 Example Generated Queries
+### 6.2 Ecto Schema Encoding
 
-**Simple SELECT:**
-```sql
--- Request: GET /users?select=id,name,email
-SELECT COALESCE(json_agg(_exrest_row), '[]'::json) AS data
-FROM (
-  SELECT json_build_object('id', "id", 'name', "name", 'email', "email") AS _exrest_row
-  FROM "users"
-) _exrest_subq
-```
-
-**With Embedded Relationship:**
-```sql
--- Request: GET /users?select=id,name,posts(id,title)
-SELECT COALESCE(json_agg(_exrest_row), '[]'::json) AS data
-FROM (
-  SELECT json_build_object(
-    'id', "id",
-    'name', "name",
-    'posts', (
-      SELECT COALESCE(json_agg(
-        json_build_object('id', "id", 'title', "title")
-      ), '[]'::json)
-      FROM "posts"
-      WHERE "user_id" = "users"."id"
-    )
-  ) AS _exrest_row
-  FROM "users"
-) _exrest_subq
-```
-
-**With Filtering and Ordering:**
-```sql
--- Request: GET /users?select=id,name&status=eq.active&order=created_at.desc&limit=10
-SELECT COALESCE(json_agg(_exrest_row), '[]'::json) AS data
-FROM (
-  SELECT json_build_object('id', "id", 'name', "name") AS _exrest_row
-  FROM "users"
-  WHERE "status" = $1
-  ORDER BY "created_at" DESC
-  LIMIT 10
-) _exrest_subq
-
--- Parameters: ["active"]
-```
-
-### 6.4 Response Streaming
-
-For large responses, ExRest can stream JSON directly from PostgreSQL:
+Resources should derive Jason.Encoder or use explicit encoding:
 
 ```elixir
-# lib/ex_rest/query/streaming.ex
-defmodule ExRest.Query.Streaming do
-  @moduledoc """
-  Streams large query results directly to the client.
-  Uses PostgreSQL cursors for memory efficiency.
-  """
+defmodule MyApp.API.Order do
+  use ExRest.Resource
+  
+  # Option 1: Derive with explicit fields (recommended)
+  @derive {Jason.Encoder, only: [:id, :reference, :status, :total, :inserted_at]}
+  
+  schema "orders" do
+    field :reference, :string
+    field :status, :string
+    field :total, :decimal
+    field :internal_notes, :string  # Not included in JSON
+    timestamps()
+  end
+end
 
-  @doc """
-  Executes a query and streams results as NDJSON (newline-delimited JSON).
+# Option 2: Explicit encoding in a view module
+defmodule ExRest.View do
+  @moduledoc """
+  Transforms Ecto structs for JSON output.
   """
-  def stream_ndjson(conn, query, params, context) do
+  
+  def render_resource(struct, fields) when is_list(fields) do
+    Map.take(struct, fields)
+  end
+  
+  def render_resource(struct, :all) do
+    struct
+    |> Map.from_struct()
+    |> Map.drop([:__meta__])
+  end
+  
+  def render_collection(structs, fields) do
+    Enum.map(structs, &render_resource(&1, fields))
+  end
+end
+```
+
+### 6.3 Streaming Large Responses
+
+For large result sets, stream results to avoid loading everything into memory:
+
+```elixir
+defmodule ExRest.Streaming do
+  @moduledoc """
+  Streams query results for large responses.
+  """
+  
+  import Plug.Conn
+  
+  @doc """
+  Stream results as a JSON array using chunked transfer encoding.
+  """
+  def stream_json(conn, repo, query, opts \\ []) do
     conn = 
       conn
-      |> Plug.Conn.put_resp_content_type("application/x-ndjson")
-      |> Plug.Conn.send_chunked(200)
+      |> put_resp_content_type("application/json")
+      |> send_chunked(200)
     
-    Postgrex.transaction(context.db_conn, fn db_conn ->
-      # Set up cursor
-      Postgrex.query!(db_conn, "DECLARE _exrest_cursor CURSOR FOR #{query}", params)
-      
-      stream_cursor(conn, db_conn)
+    {:ok, conn} = chunk(conn, "[")
+    
+    {conn, first?} = 
+      repo.transaction(fn ->
+        query
+        |> repo.stream(max_rows: opts[:batch_size] || 500)
+        |> Enum.reduce({conn, true}, fn record, {conn, first?} ->
+          json = Jason.encode!(record)
+          prefix = if first?, do: "", else: ","
+          {:ok, conn} = chunk(conn, prefix <> json)
+          {conn, false}
+        end)
+      end)
+      |> elem(1)
+    
+    {:ok, conn} = chunk(conn, "]")
+    conn
+  end
+  
+  @doc """
+  Stream results as newline-delimited JSON (NDJSON).
+  Better for very large datasets - client can process line by line.
+  """
+  def stream_ndjson(conn, repo, query, opts \\ []) do
+    conn = 
+      conn
+      |> put_resp_content_type("application/x-ndjson")
+      |> send_chunked(200)
+    
+    repo.transaction(fn ->
+      query
+      |> repo.stream(max_rows: opts[:batch_size] || 500)
+      |> Enum.each(fn record ->
+        {:ok, _} = chunk(conn, Jason.encode!(record) <> "\n")
+      end)
     end)
     
     conn
   end
+end
+```
 
-  defp stream_cursor(conn, db_conn) do
-    case Postgrex.query!(db_conn, "FETCH 100 FROM _exrest_cursor", []) do
-      %{rows: []} ->
-        :ok
-      %{rows: rows} ->
-        chunks = 
-          rows
-          |> Enum.map(fn [json] -> json <> "\n" end)
-          |> Enum.join("")
-        
-        {:ok, conn} = Plug.Conn.chunk(conn, chunks)
-        stream_cursor(conn, db_conn)
+### 6.4 Performance Characteristics
+
+**Typical performance (Jason encoding):**
+- Small response (10 records): < 1ms
+- Medium response (100 records): 1-5ms
+- Large response (1000 records): 5-20ms
+
+**Bottlenecks in order of impact:**
+1. Database query execution (I/O)
+2. Network latency
+3. JSON encoding (rarely the bottleneck)
+
+**When to use streaming:**
+- Response would exceed 10MB
+- Query returns 10,000+ rows
+- Client can process incrementally (NDJSON)
+
+### 6.5 Preloading Associations
+
+Efficient association loading is critical for performance:
+
+```elixir
+defmodule ExRest.QueryPipeline do
+  # When ?select=id,items(*) is requested
+  
+  defp apply_preloads(query, parsed_select, resource) do
+    associations = extract_associations(parsed_select)
+    
+    case associations do
+      [] -> query
+      assocs -> from(q in query, preload: ^assocs)
     end
   end
+  
+  defp extract_associations(select) do
+    select
+    |> Enum.filter(fn
+      {:assoc, _name, _fields} -> true
+      _ -> false
+    end)
+    |> Enum.map(fn {:assoc, name, _fields} -> name end)
+  end
+end
+```
+
+**Avoid N+1 queries:**
+
+```elixir
+# Bad: N+1 queries
+orders = Repo.all(Order)
+Enum.map(orders, fn o -> 
+  %{order: o, items: Repo.all(from i in Item, where: i.order_id == ^o.id)}
+end)
+
+# Good: Single query with preload
+orders = Repo.all(from o in Order, preload: [:items])
+```
+
+### 6.6 Query Optimization Tips
+
+**1. Use database indexes:**
+```sql
+-- Index columns used in filters
+CREATE INDEX idx_orders_status ON orders(status);
+CREATE INDEX idx_orders_user_tenant ON orders(user_id, tenant_id);
+
+-- Composite index for common filter + sort
+CREATE INDEX idx_orders_status_created ON orders(status, created_at DESC);
+```
+
+**2. Limit default response size:**
+```elixir
+# In resource module
+def default_limit, do: 100
+def max_limit, do: 1000
+```
+
+**3. Use COUNT efficiently:**
+```elixir
+# For Prefer: count=exact header
+defp get_count(query, :exact), do: Repo.aggregate(query, :count)
+defp get_count(query, :planned), do: get_planned_count(query)
+defp get_count(_query, :estimated), do: nil  # Let client estimate
+
+defp get_planned_count(query) do
+  # Use EXPLAIN to get row estimate (fast but approximate)
+  sql = Ecto.Adapters.SQL.to_sql(:all, Repo, query) |> elem(0)
+  result = Repo.query!("EXPLAIN #{sql}")
+  parse_row_estimate(result)
 end
 ```
 
@@ -3041,7 +2904,7 @@ Before deploying ExRest, ensure:
 **Optional (enable as needed):**
 - [ ] **Rate limiting** is configured for public-facing endpoints
 - [ ] **Caching** is configured with appropriate TTLs
-- [ ] **JSON permissions** are configured for runtime role-based access
+- [ ] **Authzura** is configured for dynamic role-based access
 
 
 ## Part 8: Future Considerations
@@ -3229,13 +3092,13 @@ This section documents additional considerations for future development phases.
 
 **Architecture Decision Records (ADRs)**
 - Why Ecto schemas required vs. database introspection
-- Why PostgREST operators as default with Hasura compatibility
+- Why clean operator syntax (`eq`) vs dots/underscores
 - Why scope/2 callback as primary authorization
-- Why optional JSON permissions layer
+- Why Authzura as separate library vs. embedded permissions
 
 **Runbooks**
 - Cache invalidation not working (when caching enabled)
-- Permission denied debugging
+- Permission denied debugging (Authzura)
 - Performance troubleshooting
 
 **Security Disclosure Process**
@@ -3251,8 +3114,10 @@ This section documents additional considerations for future development phases.
 - Generates `scope/2` callbacks from RLS policies
 
 **From Hasura**
-- Direct import of `hdb_metadata` permissions to `ex_rest.permissions` table
-- Permission filter syntax is compatible (both operator styles supported)
+- `Authzura.import_from_hasura/2` imports `hdb_metadata` directly
+- Automatically converts `_eq` → `eq` operators
+- Creates roles and permissions in Authzura tables
+- See Part 10.7 for details
 
 **From Custom APIs**
 - Endpoint mapping analysis tools
@@ -3661,55 +3526,62 @@ end
 
 ---
 
-### 9.2 Operator Reference (PostgREST vs Hasura vs PostgreSQL)
+### 9.2 Operator Reference
 
-ExRest uses **PostgREST-style operators by default** (`eq.`, `gt.`, etc.). Hasura-style underscore operators (`_eq`, `_gt`) are supported for backwards compatibility. Both map to the same PostgreSQL operations.
+ExRest/Authzura supports three operator formats that map to the same PostgreSQL operations:
 
-> **Note:** Tables below show PostgREST style first (recommended), then Hasura style (compatible).
+| Context | Format | Example |
+|---------|--------|---------|
+| **URL params** (PostgREST) | `eq.value` | `?status=eq.active` |
+| **JSON stored** (Authzura) | `{"eq": value}` | `{"status": {"eq": "active"}}` |
+| **JSON import** (Hasura) | `{"_eq": value}` | `{"status": {"_eq": "active"}}` |
+
+> **Note:** Authzura stores permissions using clean operator names (`eq`, `gt`, `and`) without dots or underscores. Hasura-style operators are accepted on import and converted automatically.
 
 #### Core Comparison Operators
 
-| PostgREST | Hasura | PostgreSQL | Description |
-|-----------|--------|------------|-------------|
-| `eq.` | `_eq` | `=` | Equal |
-| `neq.` | `_neq` | `<>` | Not equal |
-| `gt.` | `_gt` | `>` | Greater than |
-| `gte.` | `_gte` | `>=` | Greater than or equal |
-| `lt.` | `_lt` | `<` | Less than |
-| `lte.` | `_lte` | `<=` | Less than or equal |
+| URL (PostgREST) | Stored (Authzura) | Import (Hasura) | PostgreSQL |
+|-----------------|-------------------|-----------------|------------|
+| `eq.` | `eq` | `_eq` | `=` |
+| `neq.` | `neq` | `_neq` | `<>` |
+| `gt.` | `gt` | `_gt` | `>` |
+| `gte.` | `gte` | `_gte` | `>=` |
+| `lt.` | `lt` | `_lt` | `<` |
+| `lte.` | `lte` | `_lte` | `<=` |
 
 #### String Operators
 
-| PostgREST | Hasura | PostgreSQL | Description |
-|-----------|--------|------------|-------------|
-| `like.` | `_like` | `LIKE` | Pattern match (case-sensitive) |
-| `ilike.` | `_ilike` | `ILIKE` | Pattern match (case-insensitive) |
-| `not.like.` | `_nlike` | `NOT LIKE` | Negated pattern match |
-| `not.ilike.` | `_nilike` | `NOT ILIKE` | Negated case-insensitive match |
-| `match.` | `_similar` | `SIMILAR TO` | SQL regex match |
-| `not.match.` | `_nsimilar` | `NOT SIMILAR TO` | Negated SQL regex |
-| `~` | `_regex` | `~` | POSIX regex (case-sensitive) |
-| `~*` | `_iregex` | `~*` | POSIX regex (case-insensitive) |
-| `!~` | `_nregex` | `!~` | Negated POSIX regex |
-| `!~*` | `_niregex` | `!~*` | Negated case-insensitive regex |
+| URL (PostgREST) | Stored (Authzura) | Import (Hasura) | PostgreSQL |
+|-----------------|-------------------|-----------------|------------|
+| `like.` | `like` | `_like` | `LIKE` |
+| `ilike.` | `ilike` | `_ilike` | `ILIKE` |
+| `not.like.` | `nlike` | `_nlike` | `NOT LIKE` |
+| `not.ilike.` | `nilike` | `_nilike` | `NOT ILIKE` |
+| `match.` | `similar` | `_similar` | `SIMILAR TO` |
 
 #### Null Operators
 
-| PostgREST | Hasura | PostgreSQL | Description |
-|-----------|--------|------------|-------------|
-| `is.null` | `_is_null: true` | `IS NULL` | Is null |
-| `is.not.null` | `_is_null: false` | `IS NOT NULL` | Is not null |
+| URL (PostgREST) | Stored (Authzura) | Import (Hasura) | PostgreSQL |
+|-----------------|-------------------|-----------------|------------|
+| `is.null` | `{"is_null": true}` | `{"_is_null": true}` | `IS NULL` |
+| `is.not.null` | `{"is_null": false}` | `{"_is_null": false}` | `IS NOT NULL` |
 
 #### Array/List Operators
 
-| PostgREST | Hasura | PostgreSQL | Description |
-|-----------|--------|------------|-------------|
-| `in.` | `_in` | `= ANY(...)` | Value in list |
-| `not.in.` | `_nin` | `<> ALL(...)` | Value not in list |
-| `cs.` | `_contains` | `@>` | Array contains |
-| `_contained_in` | `cd.` | `<@` | Array contained in |
-| `_has_key` | `?` | `?` | JSON has key |
-| `_has_keys_any` | `?|` | `?|` | JSON has any keys |
+| URL (PostgREST) | Stored (Authzura) | Import (Hasura) | PostgreSQL |
+|-----------------|-------------------|-----------------|------------|
+| `in.` | `in` | `_in` | `= ANY(...)` |
+| `not.in.` | `nin` | `_nin` | `<> ALL(...)` |
+| `cs.` | `contains` | `_contains` | `@>` |
+| `cd.` | `contained_in` | `_contained_in` | `<@` |
+
+#### Logical Operators
+
+| URL (PostgREST) | Stored (Authzura) | Import (Hasura) | Description |
+|-----------------|-------------------|-----------------|-------------|
+| `and=()` | `{"and": [...]}` | `{"_and": [...]}` | All conditions |
+| `or=()` | `{"or": [...]}` | `{"_or": [...]}` | Any condition |
+| `not.` | `{"not": {...}}` | `{"_not": {...}}` | Negate condition |
 | `_has_keys_all` | `?&` | `?&` | JSON has all keys |
 
 #### Range Operators
@@ -3967,195 +3839,42 @@ end
 ---
 
 
-### 9.4 Optional JSON Permissions
+### 9.4 Authorization with Authzura
 
-JSON permissions provide runtime-configurable, role-based access control as an optional layer on top of `scope/2`. ExRest uses **PostgREST-style operators by default** (`eq.`, `gt.`, etc.) but supports Hasura-style underscore operators (`_eq`, `_gt`) for backwards compatibility.
+ExRest uses **Authzura** for authorization. Authzura is a **standalone library** that can be used independently of ExRest.
 
-> **Hasura Metadata Compatibility:** ExRest permission filters are designed to be compatible with Hasura's `hdb_metadata` permission format. If migrating from Hasura, you can import existing permission definitions directly. Both operator styles are fully supported and interchangeable.
+See **`authzura.md`** for complete documentation including:
+- Database schema (roles, user_roles, permissions tables)
+- Dynamic tenant-specific roles
+- Role inheritance and multi-role users
+- Permission merging strategies (most permissive wins)
+- Optional Nebulex caching with PubSub invalidation
+- Hasura import helpers
+- Phoenix/LiveView integration examples
+- Admin UI for visual permission management
 
-**When to use JSON Permissions:**
-- Role-based filters need to change without deployment
-- Non-developers need to configure access rules
-- Multi-tenant systems with tenant-specific permissions
-- Migrating from Hasura and want to reuse existing permissions
-
-**When scope/2 is sufficient:**
-- Permissions are stable and code-based
-- Complex authorization logic requiring Elixir
-- Tenant isolation that applies to all roles
-- Soft deletes, audit trails
-
-#### Permission Table Schema
-
-```sql
-CREATE TABLE ex_rest.permissions (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  resource TEXT NOT NULL,     -- Module name or table name
-  role TEXT NOT NULL,
-  action TEXT NOT NULL CHECK (action IN ('select', 'insert', 'update', 'delete')),
-  
-  -- Filter expression (PostgREST or Hasura operator syntax)
-  filter JSONB,               -- Row filter as JSON boolean expression
-  columns TEXT[],             -- Allowed columns (null = all from schema)
-  check_expr JSONB,           -- Validation for insert/update
-  presets JSONB,              -- Column presets (auto-set values)
-  
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW(),
-  
-  UNIQUE(resource, role, action)
-);
-
--- Notify on changes for cache invalidation
-CREATE OR REPLACE FUNCTION ex_rest.notify_permission_change()
-RETURNS TRIGGER AS $$
-BEGIN
-  PERFORM pg_notify('ex_rest_permissions_changed', 
-    json_build_object('resource', COALESCE(NEW.resource, OLD.resource))::text);
-  RETURN COALESCE(NEW, OLD);
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER permissions_changed
-AFTER INSERT OR UPDATE OR DELETE ON ex_rest.permissions
-FOR EACH ROW EXECUTE FUNCTION ex_rest.notify_permission_change();
-```
-
-#### Example Permissions (PostgREST Style - Recommended)
-
-```sql
--- Users can only see their own orders
-INSERT INTO ex_rest.permissions (resource, role, action, filter, columns) VALUES
-('orders', 'user', 'select', 
-  '{"user_id": {"eq.": "X-ExRest-User-Id"}}',
-  ARRAY['id', 'reference', 'status', 'total', 'inserted_at']);
-
--- Users can create orders (reference only, other fields preset)
-INSERT INTO ex_rest.permissions (resource, role, action, columns, presets) VALUES
-('orders', 'user', 'insert',
-  ARRAY['reference', 'shipping_address_id'],
-  '{"user_id": "X-ExRest-User-Id", "status": "pending"}');
-
--- Users can update only pending orders they own
-INSERT INTO ex_rest.permissions (resource, role, action, filter, columns) VALUES
-('orders', 'user', 'update',
-  '{"and": [{"user_id": {"eq.": "X-ExRest-User-Id"}}, {"status": {"eq.": "pending"}}]}',
-  ARRAY['shipping_address_id']);
-
--- Admins have full access
-INSERT INTO ex_rest.permissions (resource, role, action, filter, columns) VALUES
-('orders', 'admin', 'select', NULL, NULL),
-('orders', 'admin', 'insert', NULL, NULL),
-('orders', 'admin', 'update', NULL, NULL),
-('orders', 'admin', 'delete', NULL, NULL);
-```
-
-#### JSON Filter Syntax
-
-PostgREST-style operators (recommended):
-
-```json
-// Simple equality
-{"status": {"eq.": "active"}}
-
-// Comparison operators
-{"total": {"gt.": 100}}
-{"total": {"gte.": 100}}
-{"total": {"lt.": 1000}}
-{"total": {"lte.": 1000}}
-{"status": {"neq.": "cancelled"}}
-
-// String operators
-{"name": {"like.": "%smith%"}}
-{"email": {"ilike.": "%@example.com"}}
-
-// List operators
-{"status": {"in.": ["pending", "confirmed"]}}
-
-// Null checks
-{"deleted_at": {"is.": null}}
-
-// Logical operators
-{"and": [{"status": {"eq.": "active"}}, {"total": {"gt.": 0}}]}
-{"or": [{"role": {"eq.": "admin"}}, {"is_owner": {"eq.": true}}]}
-{"not": {"status": {"eq.": "cancelled"}}}
-
-// Session variable substitution
-{"user_id": {"eq.": "X-ExRest-User-Id"}}
-{"tenant_id": {"eq.": "X-ExRest-Tenant-Id"}}
-```
-
-Hasura-style operators (backwards compatible):
-
-```json
-// All Hasura underscore operators work identically
-{"status": {"_eq": "active"}}
-{"_and": [{"status": {"_eq": "active"}}, {"total": {"_gt": 100}}]}
-{"user_id": {"_eq": "X-Hasura-User-Id"}}
-```
-
-Both styles can be mixed in the same filter expression.
-
-#### Configuration
+**Quick Reference - ExRest Integration:**
 
 ```elixir
 # config/config.exs
-config :ex_rest, :permissions,
-  enabled: true,  # false to rely only on scope/2
-  table: "ex_rest.permissions",
-  cache_ttl: :timer.minutes(5),
-  default_deny: true  # No permission = no access (for that role)
+config :ex_rest,
+  authorization: ExRest.Authorization.Authzura
+
+config :authzura,
+  repo: MyApp.Repo,
+  schema: "authzura",
+  cache: [enabled: true, default_ttl: :timer.minutes(5)],
+  pubsub: MyApp.PubSub
 ```
 
-#### Pipeline Integration
-
-JSON permissions are applied after `scope/2` but before URL filters:
+**Pipeline Integration:**
 
 ```
 scope/2          → Always runs (tenant isolation, soft deletes)
     ↓
-JSON permissions → Optional, per-role row filters
+Authzura         → Dynamic role-based row filters (cached)
     ↓
 URL filters      → Client-specified filters (?status=eq.active)
-```
-
-#### Permission Cache
-
-```elixir
-defmodule ExRest.PermissionsCache do
-  use GenServer
-  
-  def start_link(opts) do
-    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
-  end
-  
-  def init(opts) do
-    # Subscribe to NOTIFY
-    {:ok, conn} = Postgrex.Notifications.start_link(opts[:database])
-    Postgrex.Notifications.listen(conn, "ex_rest_permissions_changed")
-    
-    # Initial load
-    permissions = load_all_permissions(opts)
-    
-    {:ok, %{permissions: permissions, conn: conn}}
-  end
-  
-  def get({resource, role, action}) do
-    GenServer.call(__MODULE__, {:get, resource, role, action})
-  end
-  
-  def handle_call({:get, resource, role, action}, _from, state) do
-    result = get_in(state.permissions, [resource, role, action])
-    {:reply, result, state}
-  end
-  
-  def handle_info({:notification, _, _, "ex_rest_permissions_changed", payload}, state) do
-    # Reload permissions for changed resource
-    %{"resource" => resource} = Jason.decode!(payload)
-    permissions = reload_resource_permissions(resource, state.permissions)
-    {:noreply, %{state | permissions: permissions}}
-  end
-end
 ```
 
 ---
@@ -4435,15 +4154,9 @@ defmodule ExRest.Application do
       []
     end
 
-    # Optional: JSON permissions cache (if enabled)
-    permissions_children = if Application.get_env(:ex_rest, [:permissions, :enabled], false) do
-      [{ExRest.PermissionsCache, [
-        pubsub: ExRest.PubSub,
-        table: Application.get_env(:ex_rest, [:permissions, :table], "ex_rest.permissions")
-      ]}]
-    else
-      []
-    end
+    # Authzura (authorization) is managed by its own supervision tree
+    # ExRest just references it via the authorization adapter config
+    # See: config :ex_rest, authorization: ExRest.Authorization.Authzura
 
     # Optional: Distributed cache (if enabled)
     cache_children = if Application.get_env(:ex_rest, [:cache, :enabled], false) do
@@ -4461,7 +4174,6 @@ defmodule ExRest.Application do
 
     children = cluster_children ++ 
                core_children ++ 
-               permissions_children ++
                cache_children ++ 
                rate_limiter_children
 
@@ -5325,14 +5037,20 @@ defp deps do
   [
     {:nimble_parsec, "~> 1.4"},      # Parser combinators
     {:postgrex, "~> 0.17"},          # PostgreSQL driver
-    {:ecto_sql, "~> 3.10"},          # SQL adapter (optional)
+    {:ecto_sql, "~> 3.10"},          # SQL adapter
     {:plug, "~> 1.14"},              # HTTP middleware
     {:plug_crypto, "~> 2.0"},        # Secure comparisons, timing-safe functions
     {:jason, "~> 1.4"},              # JSON encoding
     {:jose, "~> 1.11"},              # JWT handling
-    {:cachex, "~> 3.6"},             # In-memory caching with TTL
     {:telemetry, "~> 1.2"},          # Metrics and instrumentation
+    
+    # Optional: Caching
+    {:nebulex, "~> 2.5"},            # Caching (local/distributed/multi-level)
+    {:nebulex_redis_adapter, "~> 2.3", optional: true},  # Redis backend
+    
+    # Optional: Rate limiting  
     {:hammer, "~> 6.1"},             # Rate limiting
+    {:hammer_backend_redis, "~> 6.1", optional: true},   # Redis backend
 
     # Dev/Test
     {:ex_doc, "~> 0.30", only: :dev},
@@ -5342,5 +5060,46 @@ defp deps do
   ]
 end
 ```
+
+---
+
+
+
+## Part 10: Authzura Integration
+
+Authzura is a **standalone authorization library** documented separately. See **authzura.md** for complete documentation.
+
+### Quick Reference
+
+**What Authzura provides:**
+- Dynamic roles (tenant-specific, user-created at runtime)
+- Role inheritance and multi-role users
+- Permission merging (most permissive wins)
+- Hasura-compatible permission syntax
+- Optional Nebulex caching with PubSub invalidation
+- Materialized views for fast lookups
+- Admin UI for visual permission management
+
+**ExRest + Authzura configuration:**
+
+```elixir
+# config/config.exs
+config :ex_rest,
+  authorization: ExRest.Authorization.Authzura
+
+config :authzura,
+  repo: MyApp.Repo,
+  schema: "authzura",
+  cache: [enabled: true, default_ttl: :timer.minutes(5)],
+  pubsub: MyApp.PubSub
+```
+
+**Query pipeline:**
+
+```
+Base query → scope/2 → Authzura filter → URL filters → execute
+```
+
+**For full documentation see:** `authzura.md`
 
 ---
