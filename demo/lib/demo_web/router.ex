@@ -17,6 +17,10 @@ defmodule DemoWeb.Router do
     plug DemoWeb.Plugs.ReadOnlyApi
   end
 
+  scope "/health" do
+    get "/", DemoWeb.HealthController, :index
+  end
+
   scope "/", DemoWeb do
     pipe_through :browser
 

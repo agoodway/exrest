@@ -15,9 +15,7 @@ defmodule DemoWeb.Plugs.SqlDebug do
     :telemetry.attach(
       handler_id,
       [:demo, :repo, :query],
-      fn _event, _measurements, metadata, _config ->
-        Process.put(:pgrest_sql_queries, [metadata.query | Process.get(:pgrest_sql_queries, [])])
-      end,
+      &__MODULE__.handle_query_event/4,
       nil
     )
 
@@ -33,6 +31,11 @@ defmodule DemoWeb.Plugs.SqlDebug do
       all_sql = Enum.join(annotated, "\n---\n")
       put_resp_header(conn, "x-debug-sql", Base.encode64(all_sql))
     end)
+  end
+
+  @doc false
+  def handle_query_event(_event, _measurements, metadata, _config) do
+    Process.put(:pgrest_sql_queries, [metadata.query | Process.get(:pgrest_sql_queries, [])])
   end
 
   defp annotate_queries([_single] = queries), do: queries

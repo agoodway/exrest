@@ -64,7 +64,7 @@ defmodule Demo.MixProject do
       {:jason, "~> 1.2"},
       {:dns_cluster, "~> 0.2.0"},
       {:bandit, "~> 1.5"},
-      {:pg_rest, path: ".."},
+      {:pg_rest, github: "agoodway/pgrest"},
       {:tidewave, "~> 0.2", only: :dev},
 
       # Dev/Test
