@@ -1,0 +1,7 @@
+{
+  "dependencies": {
+    "@supabase/postgrest-js": "^2.95.3",
+    "prismjs": "^1.30.0",
+    "sql-formatter": "^15.7.0"
+  }
+}
